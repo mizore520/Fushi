@@ -17,6 +17,7 @@
 #include "leaf_d3d_trace.h"
 #include "voice_hook_ipc.h"
 #include "voice_hook_utterance_window.h"
+#include "voice_source_select.h"
 #include "xaudio_trace.h"
 
 // galgame 一键制卡 C 阶段 —— 环形缓冲诊断读取器（x64 独立小工具）。
@@ -377,6 +378,46 @@ double ClipEnergy16(const SharedHeader* h, const uint8_t* ring,
                                              c->is_float != 0);
 }
 
+// 一条 clip 承载的音频时长（毫秒）；格式不全时为 0。
+int64_t ClipDurationMs(const fushi_voice_hook::VoiceClip* c) {
+  const uint32_t block = c->channels * (c->bits_per_sample / 8);
+  if (block == 0 || c->sample_rate == 0) {
+    return 0;
+  }
+  return static_cast<int64_t>(c->byte_len) * 1000 /
+         (static_cast<int64_t>(block) * static_cast<int64_t>(c->sample_rate));
+}
+
+// clip 内 [from_ms, to_ms)（相对 clip 起点）的平均绝对幅值，与 host 的
+// ClipRangeEnergyLocked 同口径。
+double ClipRangeEnergy16(const SharedHeader* h, const uint8_t* ring,
+                         const fushi_voice_hook::VoiceClip* c, int64_t from_ms,
+                         int64_t to_ms) {
+  const uint32_t cap = h->ring_capacity;
+  const uint32_t len = c->byte_len;
+  if (cap == 0 || len == 0 || len > cap) {
+    return -1.0;
+  }
+  if (h->total_written > c->total_at_write &&
+      h->total_written - c->total_at_write > cap - len) {
+    return 0.0;  // 已被环形覆盖
+  }
+  const uint32_t block = c->channels * (c->bits_per_sample / 8);
+  uint32_t offset = 0;
+  uint32_t length = 0;
+  if (!fushi_voice_hook::VoiceClipMsToByteRange(len, block, c->sample_rate,
+                                                from_ms, to_ms, &offset,
+                                                &length)) {
+    return ClipEnergy16(h, ring, c);
+  }
+  return fushi_voice_hook::ClipEnergy16Scale(
+      ring, cap,
+      static_cast<uint32_t>((static_cast<uint64_t>(c->ring_offset % cap) +
+                             offset) %
+                            cap),
+      length, c->bits_per_sample, c->is_float != 0);
+}
+
 // 「整句语音」根修：游戏用多个 source voice 持续并行流式（语音源没人说话时流静音）。按源做能量
 // 分析选出语音源（说话前静音、文本时刻突然有能量的那条），取它从起声到静默的整段拼成一句。
 // 找 ts 附近的语音源，把该源在 [ts-200ms, 起声后连续非静音段] 的 PCM 拼接、去首尾静音，写 WAV。
@@ -404,45 +445,22 @@ bool DumpUtterance(const SharedHeader* h, const uint8_t* ring, uint64_t ts,
   if (valid.empty()) {
     return false;
   }
-  // 每源：说话前窗口 [ts-900,ts-251] 与文本时刻窗口 [ts-250,ts+450] 的平均能量。
-  std::map<uint64_t, double> e_before, e_at;
-  std::map<uint64_t, int> n_before, n_at;
-  bool any_energy = false;
+  // 选语音源：与 host 的 GrabUtterance 同一份判据（voice_source_select.h）——按 clip 承载的
+  // 音频区间与窗口重叠归属、只取重叠那一截算能量。这里曾是一份手抄副本，窗口还和 host 不同
+  // （-250 / -251 对 host 的 -150 / -250），排障时报出的「语音源」与真实取音不是同一个。
+  std::vector<fushi_voice_hook::VoiceSelectClip> candidates;
+  candidates.reserve(valid.size());
   for (const auto* c : valid) {
-    const double e = ClipEnergy16(h, ring, c);
-    if (e < 0) {
-      continue;  // 非 16-bit
-    }
-    any_energy = true;
-    const int64_t d = static_cast<int64_t>(c->timestamp_ms) -
-                      static_cast<int64_t>(ts);
-    if (d >= -900 && d <= -251) {
-      e_before[c->source_ptr] += e;
-      n_before[c->source_ptr]++;
-    }
-    if (d >= -250 && d <= 450) {
-      e_at[c->source_ptr] += e;
-      n_at[c->source_ptr]++;
-    }
+    candidates.push_back(fushi_voice_hook::VoiceSelectClip{
+        c->source_ptr, static_cast<int64_t>(c->timestamp_ms), ClipDurationMs(c)});
   }
-  // 语音源 = (文本时刻平均能量 - 说话前平均能量) 最大者：从静音跳到有声。
-  uint64_t voice_src = 0;
-  double best_delta = -1e18;
-  for (const auto& kv : e_at) {
-    if (kv.second <= 0 || n_at[kv.first] == 0) {
-      continue;
-    }
-    const double at_avg = kv.second / n_at[kv.first];
-    const double bef_avg =
-        (n_before.count(kv.first) && n_before[kv.first] > 0)
-            ? e_before[kv.first] / n_before[kv.first]
-            : 0.0;
-    const double delta = at_avg - bef_avg;
-    if (delta > best_delta) {
-      best_delta = delta;
-      voice_src = kv.first;
-    }
-  }
+  bool any_energy = false;
+  const uint64_t voice_src = fushi_voice_hook::SelectVoiceSourceByOnset(
+      candidates.data(), candidates.size(), static_cast<int64_t>(ts),
+      [&](size_t index, int64_t from_ms, int64_t to_ms) {
+        return ClipRangeEnergy16(h, ring, valid[index], from_ms, to_ms);
+      },
+      &any_energy);
   // 拼接语音源在 [下界, ts+6000] 的段；静音判据用该源峰值能量的 8%。下界与 host 的
   // GrabUtterance 共用同一份实现（BUG-1593）：clip 时间戳是**提交**时刻，流式引擎按缓冲
   // 深度提前灌入，固定 200ms 回看会整块丢掉句首。诊断工具必须和真实取音判据一致，否则

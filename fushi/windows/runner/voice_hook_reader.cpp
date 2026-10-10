@@ -32,6 +32,7 @@
 #include "../../../native/galgame_hook/include/voice_clip_energy.h"
 #include "../../../native/galgame_hook/include/voice_hook_ipc.h"
 #include "../../../native/galgame_hook/include/voice_hook_utterance_window.h"
+#include "../../../native/galgame_hook/include/voice_source_select.h"
 #include "lookup_hit_validation.h"
 #include "lookup_geometry_snapshot.h"
 
@@ -416,6 +417,47 @@ double ClipEnergyLocked(const SharedHeader* h, const uint8_t* ring,
   return fushi_voice_hook::ClipEnergy16Scale(ring, cap, c->ring_offset % cap,
                                              len, c->bits_per_sample,
                                              c->is_float != 0);
+}
+
+// 一条 clip 承载的音频时长（毫秒）；格式不全时为 0。
+int64_t ClipDurationMs(const fushi_voice_hook::VoiceClip* c) {
+  const uint32_t block = c->channels * (c->bits_per_sample / 8);
+  if (block == 0 || c->sample_rate == 0) {
+    return 0;
+  }
+  return static_cast<int64_t>(c->byte_len) * 1000 /
+         (static_cast<int64_t>(block) * static_cast<int64_t>(c->sample_rate));
+}
+
+// clip 内 [from_ms, to_ms)（相对 clip 起点）这部分音频的平均绝对幅值，口径同
+// ClipEnergyLocked。自动选源只对落进判据窗口的那一截求能量（voice_source_select.h）。
+double ClipRangeEnergyLocked(const SharedHeader* h, const uint8_t* ring,
+                             const fushi_voice_hook::VoiceClip* c,
+                             int64_t from_ms, int64_t to_ms) {
+  const uint32_t cap = h->ring_capacity;
+  const uint32_t len = c->byte_len;
+  if (cap == 0 || len == 0 || len > cap) {
+    return -1.0;
+  }
+  if (h->total_written > c->total_at_write &&
+      h->total_written - c->total_at_write > cap - len) {
+    return 0.0;  // 已被环形覆盖
+  }
+  const uint32_t block = c->channels * (c->bits_per_sample / 8);
+  uint32_t offset = 0;
+  uint32_t length = 0;
+  if (!fushi_voice_hook::VoiceClipMsToByteRange(len, block, c->sample_rate,
+                                                from_ms, to_ms, &offset,
+                                                &length)) {
+    // 区间不足一帧或格式不可换算：退回整段口径，保持「位深不认识才 < 0」的契约。
+    return ClipEnergyLocked(h, ring, c);
+  }
+  return fushi_voice_hook::ClipEnergy16Scale(
+      ring, cap,
+      static_cast<uint32_t>((static_cast<uint64_t>(c->ring_offset % cap) +
+                             offset) %
+                            cap),
+      length, c->bits_per_sample, c->is_float != 0);
 }
 
 // 两条 clip 的 PCM 格式是否一致。格式不同的段按字节拼在一起就是垃圾（采样率/声道/位深
@@ -1720,13 +1762,15 @@ VoiceHookStatus VoiceHookReader::GrabUtterance(
     filter_by_src = true;
     sel_src = target_source;
   } else {
-    // 每源：说话前窗口 [ts-900,ts-250] 与文本时刻窗口 [ts-150,ts+450] 的平均能量。
-    std::map<uint64_t, double> e_before, e_at;
-    std::map<uint64_t, int> n_before, n_at;
+    // 语音源 = 说话前窗口到文本时刻窗口能量跳升最大者。一段 clip 按它承载的音频区间
+    // [提交时刻, 提交时刻+时长) 与窗口的重叠归属、只取重叠部分算能量（判据与理由见
+    // voice_source_select.h；BUG-3268：只看提交时刻会把流式 BGM 选成语音）。
+    std::vector<fushi_voice_hook::VoiceSelectClip> candidates;
+    std::vector<const fushi_voice_hook::VoiceClip*> candidate_clips;
     std::map<uint64_t, uint64_t> bytes_at;  // 位深不认识时的格式无关代理判据
-    bool any_energy = false;
-    for (size_t i = 0; i < valid.size(); i++) {
-      const auto* c = valid[i];
+    candidates.reserve(valid.size());
+    candidate_clips.reserve(valid.size());
+    for (const auto* c : valid) {
       bool excluded = false;
       for (const uint64_t ex : exclude_sources) {
         if (ex == c->source_ptr) {
@@ -1740,43 +1784,24 @@ VoiceHookStatus VoiceHookReader::GrabUtterance(
       {
         const int64_t dd = static_cast<int64_t>(c->timestamp_ms) -
                            static_cast<int64_t>(ts_ms);
-        if (dd >= -150 && dd <= 450) {
+        if (dd >= fushi_voice_hook::kVoiceSelectAtBeginMs &&
+            dd <= fushi_voice_hook::kVoiceSelectAtEndMs) {
           bytes_at[c->source_ptr] += c->byte_len;
         }
       }
-      const double e = energies[i];
-      if (e < 0) {
-        continue;  // 位深真的不认识（8/16/24/32 与 float32 之外）
-      }
-      any_energy = true;
-      const int64_t d = static_cast<int64_t>(c->timestamp_ms) -
-                        static_cast<int64_t>(ts_ms);
-      if (d >= -900 && d <= -250) {
-        e_before[c->source_ptr] += e;
-        n_before[c->source_ptr]++;
-      }
-      if (d >= -150 && d <= 450) {
-        e_at[c->source_ptr] += e;
-        n_at[c->source_ptr]++;
-      }
+      candidates.push_back(fushi_voice_hook::VoiceSelectClip{
+          c->source_ptr, static_cast<int64_t>(c->timestamp_ms),
+          ClipDurationMs(c)});
+      candidate_clips.push_back(c);
     }
-    // 语音源 = (文本时刻平均能量 - 说话前平均能量) 最大者：从静音跳到有声。
-    double best_delta = -1e18;
-    for (const auto& kv : e_at) {
-      if (kv.second <= 0 || n_at[kv.first] == 0) {
-        continue;
-      }
-      const double at_avg = kv.second / n_at[kv.first];
-      const double bef_avg =
-          (n_before.count(kv.first) && n_before[kv.first] > 0)
-              ? e_before[kv.first] / n_before[kv.first]
-              : 0.0;
-      const double delta = at_avg - bef_avg;
-      if (delta > best_delta) {
-        best_delta = delta;
-        sel_src = kv.first;
-      }
-    }
+    bool any_energy = false;
+    sel_src = fushi_voice_hook::SelectVoiceSourceByOnset(
+        candidates.data(), candidates.size(), static_cast<int64_t>(ts_ms),
+        [&](size_t index, int64_t from_ms, int64_t to_ms) {
+          return ClipRangeEnergyLocked(h, ring, candidate_clips[index], from_ms,
+                                       to_ms);
+        },
+        &any_energy);
     if (!any_energy) {
       // 位深真的不认识（不是 8/16/24/32 也不是 float32）：能量判据用不了，但**仍然只能
       // 选一个源**。退而用格式无关的代理——文本时刻窗内写入字节最多的那个源（正在出声的
@@ -1822,15 +1847,8 @@ VoiceHookStatus VoiceHookReader::GrabUtterance(
     if (filter_by_src && c->source_ptr != sel_src) {
       continue;
     }
-    const uint32_t block = c->channels * (c->bits_per_sample / 8);
-    const int64_t dur =
-        (block == 0 || c->sample_rate == 0)
-            ? 0
-            : static_cast<int64_t>(static_cast<int64_t>(c->byte_len) * 1000 /
-                                   (static_cast<int64_t>(block) *
-                                    static_cast<int64_t>(c->sample_rate)));
     timings.push_back(fushi_voice_hook::UtteranceClipTiming{
-        static_cast<int64_t>(c->timestamp_ms), dur});
+        static_cast<int64_t>(c->timestamp_ms), ClipDurationMs(c)});
   }
   const int64_t lower_ts = fushi_voice_hook::UtteranceLowerBoundMs(
       timings.data(), timings.size(), static_cast<int64_t>(ts_ms));
