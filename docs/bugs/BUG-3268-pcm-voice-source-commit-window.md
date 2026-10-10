@@ -6,8 +6,8 @@
   - 整段平均能量：语音 598，BGM 3221～3567。探针按 host 判据复现两句，选中的都是 BGM。
   - 根因在 `fushi/windows/runner/voice_hook_reader.cpp` 的 `GrabUtterance` 选源段（修复前 1723–1779 行）：一段 clip 算不算在窗口里只看它的**提交时刻**。「说话前」窗口 [−900, −250] 只有 650ms 宽，比 BGM 的 1000ms 提交间隔还窄，BGM 常常一段都不落在里面，基线算 0，「能量跳升」就等于 BGM 的全部能量。BGM 相位每句都不同，所以表现为「有的句子对、有的不对」。同时语音在 −187ms 提交，落在「文本时刻」窗口（从 −150 起）之外，连候选都进不去。
   - host 拿到 BGM 的一秒分片后，工作台显示 1s；制卡时这段 BGM 被当成语音写进卡片。
-- **[x] ① 已修复**（提交见本分支 `pr/voice-source-overlap`）— 选源判据抽成纯函数 `native/galgame_hook/include/voice_source_select.h` 的 `SelectVoiceSourceByOnset`：一段 clip 按它承载的音频区间 [提交时刻, 提交时刻 + 时长) 与窗口的**重叠**归属，只对重叠那一截算能量（`ClipRangeEnergyLocked`），按重叠时长加权平均。窗口位置、「跳升最大者」判据和字节兜底都不变。BGM 在两个窗口都有真实能量，跳升趋近 0；语音只在文本时刻窗口有声。跨过两个窗口的一整段语音也不会两边取到同一个平均值而互相抵消。只读探针 `ring_probe` 原来抄了一份窗口还不一样的副本（−250/−251），改为调用同一个函数。
-- **[x] ② 已加自动化测试**（同一提交）— `native/galgame_hook/tests/voice_source_select_test.cpp`（CTest `fushi_voice_source_select_test`）：两句真机时间线、BGM 相位整周期扫描（0～975ms，步长 25）、语音跨两个窗口、流式语音起声（旧场景不变）、能量不可算时如实报告、窗口外不参与、毫秒到字节区间的帧对齐与夹取。把判据换回「只看提交时刻」后，两句真机用例与全部相位用例都会失败。x64 / x86（MSVC，`/W4 /WX`）均通过。
+- **[x] ① 已修复**（`1da5f944c`）— 选源判据抽成纯函数 `native/galgame_hook/include/voice_source_select.h` 的 `SelectVoiceSourceByOnset`：一段 clip 按它承载的音频区间 [提交时刻, 提交时刻 + 时长) 与窗口的**重叠**归属，只对重叠那一截算能量（`ClipRangeEnergyLocked`），按重叠时长加权平均。窗口位置、「跳升最大者」判据和字节兜底都不变。BGM 在两个窗口都有真实能量，跳升趋近 0；语音只在文本时刻窗口有声。跨过两个窗口的一整段语音也不会两边取到同一个平均值而互相抵消。只读探针 `ring_probe` 原来抄了一份窗口还不一样的副本（−250/−251），改为调用同一个函数。
+- **[x] ② 已加自动化测试**（`1da5f944c`）— `native/galgame_hook/tests/voice_source_select_test.cpp`（CTest `fushi_voice_source_select_test`）：两句真机时间线、BGM 相位整周期扫描（0～975ms，步长 25）、语音跨两个窗口、流式语音起声（旧场景不变）、能量不可算时如实报告、窗口外不参与、毫秒到字节区间的帧对齐与夹取。把判据换回「只看提交时刻」后，两句真机用例与全部相位用例都会失败。x64 / x86（MSVC，`/W4 /WX`）均通过。
 - **备注**：
   - 这是通用 PCM 配对逻辑，所有走 DirectSound / XAudio2 捕获、同时有流式 BGM 的游戏都受益，不是按游戏打的特例。
   - 实机复测待做：修复版构建后在原始启动路径上推进几句有配音的长、短台词，确认工作台时长与卡片音频为角色语音。
