@@ -328,6 +328,66 @@ void main() {
   });
 
   testWidgets(
+    'thread selector hides generic Luna threads once an engine exact thread '
+    'has produced lines',
+    (WidgetTester tester) async {
+      final TexthookerService svc = TexthookerService.instance;
+      svc.registerTextThread(
+        key: 'kogado:exact',
+        label: 'Kogado Hy exact · 0x8948244',
+        hookCode: 'ENGINE:KOGADO_HY:message_page',
+        nativeThreadId: 0x11,
+      );
+      svc.registerTextThread(
+        key: 'hook:textout',
+        label: 'TextOutA · 0x1000',
+        hookCode: 'HS932#-8@0:gdi32.dll:TextOutA',
+        nativeThreadId: 0x22,
+      );
+      svc.registerTextThread(
+        key: 'hook:widechar',
+        label: 'WideCharToMultiByte · 0x2000',
+        hookCode: 'HQC@0:kernel32.dll:WideCharToMultiByte',
+        nativeThreadId: 0x33,
+      );
+      svc.applyTextThreadPreviews(<TexthookerThreadPreview>[
+        const TexthookerThreadPreview(
+          nativeThreadId: 0x11,
+          text: '「その方が楽だもん」',
+          observedLineCount: 14,
+          observedArtifactCount: 0,
+          isArtifact: false,
+        ),
+        const TexthookerThreadPreview(
+          nativeThreadId: 0x22,
+          text: '「その方が',
+          observedLineCount: 40,
+          observedArtifactCount: 0,
+          isArtifact: false,
+        ),
+        const TexthookerThreadPreview(
+          nativeThreadId: 0x33,
+          text: 'kogado-hy-lookup: hit gen=145',
+          observedLineCount: 9,
+          observedArtifactCount: 0,
+          isArtifact: false,
+        ),
+      ]);
+      await tester.pumpWidget(_wrapPage(const TexthookerPage()));
+      await tester.pump();
+
+      await tester.tap(
+        find.byKey(const ValueKey<String>('game-text-thread-selector')),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.textContaining('Kogado Hy exact'), findsWidgets);
+      expect(find.textContaining('TextOutA'), findsNothing);
+      expect(find.textContaining('WideCharToMultiByte'), findsNothing);
+    },
+  );
+
+  testWidgets(
     'inactive workbench exposes low-frequency actions without a menu',
     (WidgetTester tester) async {
       await tester.pumpWidget(_wrapPage(const TexthookerPage()));

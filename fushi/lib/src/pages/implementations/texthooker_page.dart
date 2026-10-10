@@ -2101,9 +2101,15 @@ class _TexthookerPageState extends ConsumerState<TexthookerPage>
     final List<TexthookerLineEntry> visibleLines = lines
         .where((TexthookerLineEntry e) => lineMatchesFilter(e, _lineFilter))
         .toList(growable: false);
+    // 下拉只列给用户看的线程：已有引擎精确线程出过台词时，同局的通用 Luna 线程
+    // 不再列出（当前选中的保留），见 visibleTextThreads。
+    final List<TexthookerTextThread> pickerThreads = visibleTextThreads(
+      textThreads,
+      selectedKey: selectedTextThreadKey,
+    );
     // 重名线程（同 hookName + 地址、不同调用上下文）补 `#N` 序号，供下拉区分。
     final Map<String, String> threadDisplayLabels = assignThreadDisplayLabels(
-      textThreads,
+      pickerThreads,
     );
     final FushiTypography type = context.fushiType;
     final bool glass = isGlassDesign(context);
@@ -2116,9 +2122,9 @@ class _TexthookerPageState extends ConsumerState<TexthookerPage>
       focusId: const FushiFocusId('game-text-thread-selector'),
       label: t.game_text_thread,
       hintText: t.game_text_thread_hint,
-      enabled: textThreads.isNotEmpty,
+      enabled: pickerThreads.isNotEmpty,
       selected:
-          textThreads.any(
+          pickerThreads.any(
             (TexthookerTextThread thread) =>
                 thread.key == selectedTextThreadKey,
           )
@@ -2128,7 +2134,7 @@ class _TexthookerPageState extends ConsumerState<TexthookerPage>
         // v12：空值不再是「全部线程」——不选就一行都不发布。标签必须如实
         // 说明，否则用户会以为不选也在抓，然后奇怪为什么没有台词。
         (value: '', label: t.game_text_thread_unset),
-        for (final TexthookerTextThread thread in textThreads)
+        for (final TexthookerTextThread thread in pickerThreads)
           (
             value: thread.key,
             // 同一 hook 面在不同调用上下文会报成多条同 label 线程；
@@ -2146,7 +2152,7 @@ class _TexthookerPageState extends ConsumerState<TexthookerPage>
       // 只能对着「引擎 · 地址 · 行数」盲选（用户实拍反馈）。
       entrySubtitle: (String key) {
         if (key.isEmpty) return null; // 「全部」行不带预览
-        for (final TexthookerTextThread thread in textThreads) {
+        for (final TexthookerTextThread thread in pickerThreads) {
           if (thread.key == key) {
             return texthookerThreadSubtitle(
               audioLineCount: thread.audioLineCount,
@@ -2168,7 +2174,7 @@ class _TexthookerPageState extends ConsumerState<TexthookerPage>
       onChanged: (String value) {
         TexthookerTextThread? selectedThread;
         if (value.isNotEmpty) {
-          for (final TexthookerTextThread thread in textThreads) {
+          for (final TexthookerTextThread thread in pickerThreads) {
             if (thread.key == value) {
               selectedThread = thread;
               break;

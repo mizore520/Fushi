@@ -214,14 +214,46 @@ enum TexthookerLineFilter { all, withAudio, mined, favorited }
 /// 引擎适配器自产的**精确文本线程**：hook code 以 `ENGINE:` 为前缀，与 Luna 启发式
 /// hook 的 `HQFN-24@...` 一类码区分。
 ///
-/// **目前只有 SGRE 一家**用这个前缀（`ENGINE:SGRE:wind3d11`，见
-/// `native/galgame_hook/hook/adapters/sgre_lookup.inc` 的 `kSgreTextHookCode`）。
+/// 用这个前缀的是各引擎适配器的正文通道（如 `ENGINE:SGRE:wind3d11`、
+/// `ENGINE:KOGADO_HY:message_page`，见各 adapter 的 `k*TextHookCode`）。
 /// Siglus 的 TextRender 发的是 `EXBWX0@%llX:SiglusEngine.exe`、Unity 发的是
 /// `UnityEngine.TextMesh.set_text(glyphs)`，两者都**不**带该前缀，因此不走这条
-/// 自动选中路径——别把它们写成同样受益，那会让人以为覆盖面比实际大。
-/// native 侧命名契约见各 adapter 的 `k*TextHookCode`。
+/// 路径——别把它们写成同样受益，那会让人以为覆盖面比实际大。
 bool isEngineExactTextThread(TexthookerTextThread thread) =>
     (thread.hookCode ?? '').startsWith('ENGINE:');
+
+/// 线程选择器里**给用户看**的线程。
+///
+/// 只要本局已有一条引擎精确线程（[isEngineExactTextThread]）真的出过台词、且不以伪影
+/// 为主，就只列精确线程：它由适配器在已证明的绘制边界上产出，内容就是屏幕上那句；
+/// 同局 LunaHook 通用线程（`TextOutA` / `WideCharToMultiByte` 等，甚至会抓到 hook
+/// DLL 自己的诊断日志）在这种局面下只会让人选错。精确线程还没出过干净台词时原样
+/// 返回全部线程——那正是需要通用线程兜底的时候。
+///
+/// 这与线程目录排序（[TexthookerService.textThreadsSince]）「不藏，只是排后面」的约定不矛盾：
+/// 那条约定针对启发式线程之间的比较，谁也没被证明；这里隐藏的前提是已有一条被证明的。
+///
+/// [selectedKey] 对应的线程无论是否通用都保留：用户或跨会话记忆已经选中的线程从下拉
+/// 里消失，等于让当前选择无法被看到、也无法被改回。
+/// 只影响显示；会话内部的自动选择、记忆恢复仍读完整的线程目录。
+List<TexthookerTextThread> visibleTextThreads(
+  List<TexthookerTextThread> threads, {
+  String? selectedKey,
+}) {
+  final bool hasProvenExact = threads.any(
+    (TexthookerTextThread thread) =>
+        isEngineExactTextThread(thread) &&
+        thread.observedLineCount > 0 &&
+        !thread.isArtifactDominated,
+  );
+  if (!hasProvenExact) return threads;
+  return threads
+      .where(
+        (TexthookerTextThread thread) =>
+            isEngineExactTextThread(thread) || thread.key == selectedKey,
+      )
+      .toList(growable: false);
+}
 
 /// 一条可由用户选择的文本 Hook 线程。
 ///

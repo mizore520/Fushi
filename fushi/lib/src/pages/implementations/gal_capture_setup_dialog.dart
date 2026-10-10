@@ -228,7 +228,11 @@ class _GalCaptureSetupDialogState extends State<GalCaptureSetupDialog> {
   }
 
   Widget _buildThreadPane(BuildContext context) {
-    final List<TexthookerTextThread> threads = widget.session.textThreads;
+    // 与工作台下拉同一判据：已有引擎精确线程出过台词时只列精确线程（选中的保留）。
+    final List<TexthookerTextThread> threads = visibleTextThreads(
+      widget.session.textThreads,
+      selectedKey: widget.session.selectedTextThreadKey,
+    );
     final Map<String, String> labels = assignThreadDisplayLabels(threads);
     final bool glass = isGlassDesign(context);
     // M3E：外框是 surface 底的描边卡，候选线程是一组分段行（组首尾大圆角、

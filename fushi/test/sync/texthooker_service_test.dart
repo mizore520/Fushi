@@ -682,4 +682,93 @@ void main() {
       expect(svc.textThreads.single.previewText, isNull);
     });
   });
+
+  group('visibleTextThreads', () {
+    // 真机（シンフォニック=レイン，2026-10-10）：精确线程与 LunaHook 通用线程同局出现，
+    // 其中 WideCharToMultiByte 那条抓到的是 hook DLL 自己的诊断日志。
+    TexthookerTextThread thread(
+      String key, {
+      String? hookCode,
+      int lines = 0,
+      int artifacts = 0,
+    }) => TexthookerTextThread(
+      key: key,
+      label: key,
+      lineCount: 0,
+      latestAt: DateTime(2026),
+      hookCode: hookCode,
+      observedLineCount: lines,
+      observedArtifactCount: artifacts,
+    );
+    final TexthookerTextThread exact = thread(
+      'kogado:1',
+      hookCode: 'ENGINE:KOGADO_HY:message_page',
+      lines: 14,
+    );
+    final TexthookerTextThread textOut = thread(
+      'hook:2',
+      hookCode: 'HS932#-8@0:gdi32.dll:TextOutA',
+      lines: 40,
+    );
+    final TexthookerTextThread wideChar = thread(
+      'hook:3',
+      hookCode: 'HQC@0:kernel32.dll:WideCharToMultiByte',
+      lines: 9,
+    );
+
+    List<String> keys(List<TexthookerTextThread> threads) =>
+        threads.map((TexthookerTextThread t) => t.key).toList();
+
+    test('精确线程出过台词后只列精确线程', () {
+      expect(
+        keys(
+          visibleTextThreads(<TexthookerTextThread>[textOut, exact, wideChar]),
+        ),
+        <String>['kogado:1'],
+      );
+    });
+
+    test('当前选中的通用线程照样保留', () {
+      expect(
+        keys(
+          visibleTextThreads(<TexthookerTextThread>[
+            textOut,
+            exact,
+            wideChar,
+          ], selectedKey: 'hook:2'),
+        ),
+        <String>['hook:2', 'kogado:1'],
+      );
+    });
+
+    test('精确线程还没出过台词时原样列出全部线程', () {
+      final List<TexthookerTextThread> threads = <TexthookerTextThread>[
+        textOut,
+        thread('kogado:1', hookCode: 'ENGINE:KOGADO_HY:message_page'),
+        wideChar,
+      ];
+      expect(identical(visibleTextThreads(threads), threads), isTrue);
+    });
+
+    test('精确线程以伪影为主时不算数，原样列出全部线程', () {
+      final List<TexthookerTextThread> threads = <TexthookerTextThread>[
+        textOut,
+        thread(
+          'kogado:1',
+          hookCode: 'ENGINE:KOGADO_HY:message_page',
+          lines: 10,
+          artifacts: 8,
+        ),
+      ];
+      expect(keys(visibleTextThreads(threads)), <String>['hook:2', 'kogado:1']);
+    });
+
+    test('没有精确线程时原样列出全部线程', () {
+      final List<TexthookerTextThread> threads = <TexthookerTextThread>[
+        textOut,
+        wideChar,
+      ];
+      expect(identical(visibleTextThreads(threads), threads), isTrue);
+    });
+  });
 }
